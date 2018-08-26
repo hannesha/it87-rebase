@@ -210,6 +210,8 @@ static bool fix_pwm_polarity;
 #define IT87_REG_ALARM2        0x02
 #define IT87_REG_ALARM3        0x03
 
+#define IT87_REG_BANK		0x06
+
 /*
  * The IT8718F and IT8720F have the VID value in a different register, in
  * Super-I/O configuration space.
@@ -304,6 +306,7 @@ struct it87_devices {
 #define FEAT_VIN3_5V		BIT(18)	/* VIN3 connected to +5V */
 #define FEAT_FOUR_FANS		BIT(19)	/* Supports four fans */
 #define FEAT_FOUR_PWM		BIT(20)	/* Supports four fan controls */
+#define FEAT_BANK_SEL		BIT(21)	/* Chip has multi-bank support */
 
 static const struct it87_devices it87_devices[] = {
 	[it87] = {
@@ -503,6 +506,7 @@ static const struct it87_devices it87_devices[] = {
 #define has_four_pwm(data)	((data)->features & (FEAT_FOUR_PWM | \
 						     FEAT_FIVE_PWM \
 						     | FEAT_SIX_PWM))
+#define has_bank_sel(data)	((data)->features & FEAT_BANK_SEL)
 
 struct it87_sio_data {
 	int sioaddr;
@@ -530,6 +534,7 @@ struct it87_data {
 	int sioaddr;
 	enum chips type;
 	u32 features;
+	u8 bank;
 	u8 peci_mask;
 	u8 old_peci_mask;
 
@@ -679,15 +684,28 @@ static const unsigned int pwm_freq[8] = {
 	750000,
 };
 
-/*
- * Must be called with data->update_lock held, except during initialization.
- * We ignore the IT87 BUSY flag at this moment - it could lead to deadlocks,
- * would slow down the IT87 access and should not be necessary.
- */
-static int it87_read_value(struct it87_data *data, u8 reg)
+static int _it87_read_value(struct it87_data *data, u8 reg)
 {
 	outb_p(reg, data->addr + IT87_ADDR_REG_OFFSET);
 	return inb_p(data->addr + IT87_DATA_REG_OFFSET);
+}
+
+static void _it87_write_value(struct it87_data *data, u8 reg, u8 value)
+{
+	outb_p(reg, data->addr + IT87_ADDR_REG_OFFSET);
+	outb_p(value, data->addr + IT87_DATA_REG_OFFSET);
+}
+
+static void it87_set_bank(struct it87_data *data, u8 bank)
+{
+	if (has_bank_sel(data) && bank != data->bank) {
+		u8 breg = _it87_read_value(data, IT87_REG_BANK);
+
+		breg &= 0x1f;
+		breg |= (bank << 5);
+		data->bank = bank;
+		_it87_write_value(data, IT87_REG_BANK, breg);
+	}
 }
 
 /*
@@ -695,10 +713,21 @@ static int it87_read_value(struct it87_data *data, u8 reg)
  * We ignore the IT87 BUSY flag at this moment - it could lead to deadlocks,
  * would slow down the IT87 access and should not be necessary.
  */
-static void it87_write_value(struct it87_data *data, u8 reg, u8 value)
+static int it87_read_value(struct it87_data *data, u16 reg)
 {
-	outb_p(reg, data->addr + IT87_ADDR_REG_OFFSET);
-	outb_p(value, data->addr + IT87_DATA_REG_OFFSET);
+	it87_set_bank(data, reg >> 8);
+	return _it87_read_value(data, reg & 0xff);
+}
+
+/*
+ * Must be called with data->update_lock held, except during initialization.
+ * We ignore the IT87 BUSY flag at this moment - it could lead to deadlocks,
+ * would slow down the IT87 access and should not be necessary.
+ */
+static void it87_write_value(struct it87_data *data, u16 reg, u8 value)
+{
+	it87_set_bank(data, reg >> 8);
+	_it87_write_value(data, reg & 0xff, value);
 }
 
 static void it87_update_pwm_ctrl(struct it87_data *data, int nr)
@@ -3109,6 +3138,8 @@ static int it87_probe(struct platform_device *pdev)
 	data->features = it87_devices[sio_data->type].features;
 	data->peci_mask = it87_devices[sio_data->type].peci_mask;
 	data->old_peci_mask = it87_devices[sio_data->type].old_peci_mask;
+	data->bank = 0xff;
+
 	/*
 	 * IT8705F Datasheet 0.4.1, 3h == Version G.
 	 * IT8712F Datasheet 0.9.1, section 8.3.5 indicates 8h == Version J.
